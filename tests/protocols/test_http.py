@@ -291,6 +291,21 @@ async def test_get_request(http_protocol_cls: type[HTTPProtocol]):
     assert b"Hello, world" in protocol.transport.buffer
 
 
+async def test_header_value_strips_surrounding_whitespace(http_protocol_cls: type[HTTPProtocol]):
+    headers: list[tuple[bytes, bytes]] = []
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        assert scope["type"] == "http"
+        headers.extend(scope["headers"])
+        await Response("Hello, world", media_type="text/plain")(scope, receive, send)
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(b"GET / HTTP/1.1\r\nHost: example.org\r\nX-Test: \t hello \t \r\n\r\n")
+    await protocol.loop.run_one()
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+    assert (b"x-test", b"hello") in headers
+
+
 @pytest.mark.parametrize(
     "char",
     [
@@ -346,7 +361,17 @@ async def test_invalid_header_name(http_protocol_cls: type[HTTPProtocol], name: 
     assert protocol.transport.is_closing()
 
 
-@pytest.mark.parametrize("path", ["/", "/?foo", "/?foo=bar", "/?foo=bar&baz=1"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/",
+        "/?foo",
+        "/?foo=bar",
+        "/?foo=bar&baz=1",
+        pytest.param("/one%2Ftwo", id="percent-encoded-slash"),
+        pytest.param("/%41", id="percent-encoded-letter"),
+    ],
+)
 async def test_request_logging(path: str, http_protocol_cls: type[HTTPProtocol], caplog: pytest.LogCaptureFixture):
     get_request_with_query_string = b"\r\n".join(
         [f"GET {path} HTTP/1.1".encode("ascii"), b"Host: example.org", b"", b""]
@@ -360,6 +385,21 @@ async def test_request_logging(path: str, http_protocol_cls: type[HTTPProtocol],
     protocol.data_received(get_request_with_query_string)
     await protocol.loop.run_one()
     assert f'"GET {path} HTTP/1.1" 200' in caplog.records[0].message
+
+
+async def test_request_logging_escapes_quotes(http_protocol_cls: type[HTTPProtocol], caplog: pytest.LogCaptureFixture):
+    if http_protocol_cls.__name__ == "ZttpProtocol":
+        pytest.skip("zttp rejects quotes in the request target")
+
+    caplog.set_level(logging.INFO, logger="uvicorn.access")
+    logging.getLogger("uvicorn.access").propagate = True
+
+    app = Response("Hello, world", media_type="text/plain")
+
+    protocol = get_connected_protocol(app, http_protocol_cls, log_config=None)
+    protocol.data_received(b'GET /foo"bar?a"b HTTP/1.1\r\nHost: example.org\r\n\r\n')
+    await protocol.loop.run_one()
+    assert '"GET /foo%22bar?a%22b HTTP/1.1" 200' in caplog.records[0].message
 
 
 async def test_head_request(http_protocol_cls: type[HTTPProtocol]):
@@ -996,6 +1036,8 @@ async def test_scopes(
         pytest.param(b"G?T / HTTP/1.1", id="invalid-method"),
         pytest.param(b"GET /?x=y z HTTP/1.1", id="invalid-path"),
         pytest.param(b"GET / HTTP1.1", id="invalid-http-version"),
+        pytest.param(b"GET /caf\xc3\xa9 HTTP/1.1", id="non-ascii-path"),
+        pytest.param(b"GET /?q=caf\xc3\xa9 HTTP/1.1", id="non-ascii-query"),
     ],
 )
 async def test_invalid_http_request(
